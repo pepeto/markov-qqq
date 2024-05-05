@@ -1,5 +1,5 @@
 import streamlit as st
-import talib
+import ta
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -35,21 +35,21 @@ data['SMA'] = data['OHL'].rolling(window=sma_period).mean()
 data['SMA_log_return'] = np.log(data['SMA'] / data['SMA'].shift(1))
 data['sma_scaled'] = scaler.fit_transform(data['SMA_log_return'].values.reshape(-1, 1))
 
-data['EMA'] = talib.EMA(data['OHL'], timeperiod=ema_period)
+data['EMA'] = ta.trend.EMAIndicator(data['OHL'], window=ema_period).ema_indicator()
 data['EMA_log_return'] = np.log(data['EMA'] / data['EMA'].shift(1))
 data['ema_scaled'] = scaler.fit_transform(data['EMA_log_return'].values.reshape(-1, 1))
 
-data['WMA'] = talib.WMA(data['OHL'], timeperiod=wma_period)
+data['WMA'] = ta.trend.WMAIndicator(data['OHL'], window=wma_period).wma()
 data['WMA_log_return'] = np.log(data['WMA'] / data['WMA'].shift(1))
 data['wma_scaled'] = scaler.fit_transform(data['WMA_log_return'].values.reshape(-1, 1))
 
-data['RSI'] = talib.RSI(data['OHL'], timeperiod=rsi_period)
+data['RSI'] = ta.momentum.RSIIndicator(data['OHL'], window=rsi_period).rsi()
 data['rsi_scaled'] = MM_scaler.fit_transform(data['RSI'].values.reshape(-1, 1))
 
-data['WILLR'] = talib.WILLR(data['High'], data['Low'], data['Close'], timeperiod=willr_period)
+data['WILLR'] = ta.momentum.WilliamsRIndicator(data['High'], data['Low'], data['Close'], lbp=willr_period).williams_r()
 data['willr_scaled'] = MM_scaler.fit_transform(data['WILLR'].values.reshape(-1, 1))
 
-data['CCI'] = talib.CCI(data['High'], data['Low'], data['Close'], timeperiod=cci_period)
+data['CCI'] = ta.trend.CCIIndicator(data['High'], data['Low'], data['Close'], window=cci_period).cci()
 data['cci_scaled'] = MM_scaler.fit_transform(data['CCI'].values.reshape(-1, 1))
 
 data['Range'] = (data['High'] / data['Low']) - 1
