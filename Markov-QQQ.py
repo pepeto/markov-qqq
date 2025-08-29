@@ -1,34 +1,35 @@
 """
-Minimal HMM (daily) with macro features from Stooq
-- Goal: maximize backtest stability with few, meaningful features to avoid overfitting.
-- Features used (7 total):
-    1) logret        = log(C_t / C_{t-1})          [price drift; interpretable]
-    2) range         = (H_t / L_t) - 1             [intraday volatility proxy]
-    3) rv20          = sqrt(sum_{i=1..20} r_{t-i+1}^2)  [realized volatility]
-    4) ret_20d       = log(C_t / C_{t-20})         [medium-term momentum]
-    5) VIX_z60       = z-score 60d of VIX          [market stress, normalized]
-    6) SLOPE_2s10s_z60 = z-score 60d of 10Y-2Y     [macro cycle / risk regime]
-    7) dUS10Y_1d     = daily change of US10Y yield [rates impulse]
+Minimal daily HMM with macro (Stooq + Yahoo VIX)
+- Focus on a few high-signal features to avoid overfitting (7 features):
+    1) logret              = log(C_t / C_{t-1})           [price drift; interpretable]
+    2) range               = (H_t / L_t) - 1              [intraday volatility proxy]
+    3) rv20                = sqrt(sum_{i=1..20} r_{t-i+1}^2)  [realized volatility]
+    4) ret_20d             = log(C_t / C_{t-20})          [medium-term momentum]
+    5) VIX_z60             = 60d z-score of VIX           [market stress, normalized]
+    6) SLOPE_2s10s_z60     = 60d z-score of (US10Y - US2Y) [macro cycle / risk regime]
+    7) dUS10Y_1d           = daily change of US10Y yield  [rates impulse]
 
-- Data source: Stooq via pandas_datareader
-    * Price: user ticker (e.g., QQQ)
-    * VIX:   "VI.F"
-    * 10Y:   "10YUSY.B"
-    * 2Y:    "2YUSY.B"
+- Data:
+    * Price (target symbol): Stooq via pandas_datareader
+    * Yields (US10Y, US2Y): Stooq via pandas_datareader
+    * VIX: Yahoo via yfinance (Stooq often blocks commodities via DataReader)
 
-- Modeling:
-    * GaussianHMM(n_components=2, covariance_type="diag") for robustness
-    * First feature kept as raw log-return for interpretability (state means)
-    * Signal smoothing to reduce noise:
-        - Hysteresis on bull probability: enter > 0.60, exit < 0.40
-        - Minimum dwell time: require >= 3 days before switching regime
+- Model:
+    * GaussianHMM(n_components=2, covariance_type="diag") for stability
+    * First feature kept as raw log-return to interpret state means
+    * Signal smoothing:
+        - Hysteresis on P(bull): enter > 0.60, exit < 0.40
+        - Minimum dwell time: >= 3 bars before adopting a new regime
 
 - Plot:
     * y-axis logarithmic
-    * bull regime in green, bear in red
-    * deterministic forecast via argmax transition for next N business days
+    * green = bull regime, red = bear regime
+    * deterministic N-step forecast via argmax transition path
 
-- No try/except, no .iloc (use .loc and index labels), comments in English.
+- Style:
+    * No try/except
+    * No .iloc (use .loc and index labels)
+    * Comments in English; UI in Spanish.
 """
 
 import streamlit as st
@@ -37,22 +38,23 @@ import pandas as pd
 import plotly.graph_objects as go
 from hmmlearn import hmm
 from pandas_datareader.data import DataReader
+import yfinance as yf
 
 # -----------------------------
 # Streamlit UI (minimal)
 # -----------------------------
 st.set_page_config(layout="wide")
-st.title("HMM minimalista (Stooq) con macro: VIX y tasas")
+st.title("HMM minimalista (Stooq) con VIX y tasas")
 
 symbol_in = st.text_input("Especie (Stooq)", "QQQ")
 forecast_horizon = int(st.number_input("Horizonte de predicción (días hábiles)", value=15, min_value=1, step=1))
 
-# Smoothing hyperparameters (kept simple, fixed values)
+# Smoothing hyperparameters (fixed, simple)
 PROBA_ENTER = 0.60   # enter long if P(bull) > 0.60
 PROBA_EXIT  = 0.40   # exit long if P(bull) < 0.40
 MIN_DWELL   = 3      # minimum bars in a regime before switching
 
-# Normalize symbol (Stooq tickers usually uppercase)
+# Normalize symbol (Stooq tickers uppercase)
 SYMBOL = symbol_in.strip().upper()
 
 # -----------------------------
@@ -62,7 +64,7 @@ start_date = pd.Timestamp(1900, 1, 1).date()
 end_date = (pd.Timestamp.utcnow().floor("D") + pd.Timedelta(days=1)).date()
 
 # -----------------------------
-# Data loaders (Stooq)
+# Data loaders
 # -----------------------------
 def stooq_ohlc(symbol: str) -> pd.DataFrame:
     """Download OHLC from Stooq, ascending index."""
@@ -71,16 +73,22 @@ def stooq_ohlc(symbol: str) -> pd.DataFrame:
     return df
 
 def stooq_close(symbol: str) -> pd.Series:
-    """Download 'Close' series from Stooq, ascending index."""
+    """Download 'Close' from Stooq, ascending index."""
     df = stooq_ohlc(symbol)
-    s = df["Close"].rename(symbol)
-    return s
+    return df["Close"].rename(symbol)
+
+def yahoo_close(symbol: str) -> pd.Series:
+    """Download 'Close' from Yahoo via yfinance, ascending index."""
+    df = yf.download(symbol, start="1900-01-01", progress=False, auto_adjust=False)
+    df = df.sort_index()
+    s = pd.Series(df["Close"].astype("float64"))
+    s.index = pd.to_datetime(s.index).tz_localize(None)  # ensure naive datetime index
+    return s.rename(symbol)
 
 # -----------------------------
 # Download price and macro series
 # -----------------------------
 price = stooq_ohlc(SYMBOL)
-
 needed = {"Open", "High", "Low", "Close"}
 if not needed.issubset(set(price.columns)):
     st.error("Faltan columnas OHLC en los datos de Stooq para el símbolo elegido.")
@@ -90,28 +98,30 @@ if len(price) < 200:
     st.error("Muy pocos datos para entrenar el HMM. Revisa el símbolo o rango temporal.")
     st.stop()
 
-# Macro symbols from Stooq
-VIX   = stooq_close("VI.F").rename("VIX")
+# Macro:
+# - VIX from Yahoo (^VIX) because Stooq often blocks commodities through DataReader.
+# - US10Y and US2Y from Stooq.
+VIX   = yahoo_close("^VIX").rename("VIX")
 US10Y = stooq_close("10YUSY.B").rename("US10Y")
 US2Y  = stooq_close("2YUSY.B").rename("US2Y")
 
 # -----------------------------
-# Feature engineering helpers
+# Feature helpers
 # -----------------------------
 def zscore_roll(s: pd.Series, win: int = 60) -> pd.Series:
-    """Rolling z-score with specified window (min_periods=win)."""
+    """Rolling z-score with a fixed window (min_periods=win)."""
     mean = s.rolling(win, min_periods=win).mean()
     std  = s.rolling(win, min_periods=win).std(ddof=0)
     z = (s - mean) / std
     return z.rename(f"{s.name}_z{win}")
 
 def diff1(s: pd.Series) -> pd.Series:
-    """Simple first difference."""
+    """First difference."""
     return s.diff(1).rename(f"d{s.name}_1d")
 
 def hysteresis_binary(proba: pd.Series, upper: float, lower: float) -> pd.Series:
     """
-    Convert probability series to binary signal with hysteresis:
+    Convert probability series to binary with hysteresis:
       - If prev==0 and proba>upper: switch to 1
       - If prev==1 and proba<lower: switch to 0
       - Else: keep previous
@@ -130,7 +140,7 @@ def hysteresis_binary(proba: pd.Series, upper: float, lower: float) -> pd.Series
 def enforce_min_dwell(signal: pd.Series, min_bars: int) -> pd.Series:
     """
     Enforce minimum dwell time on a binary signal:
-      - A regime switch only confirmed after 'min_bars' consecutive bars in new state.
+      - Confirm a regime only after 'min_bars' consecutive bars in the new state.
     """
     out = pd.Series(index=signal.index, dtype="float64")
     current = 0.0
@@ -147,17 +157,16 @@ def enforce_min_dwell(signal: pd.Series, min_bars: int) -> pd.Series:
     return out.rename("signal_dwell")
 
 # -----------------------------
-# Build macro DataFrame
+# Macro engineered series
 # -----------------------------
 slope_2s10s = (US10Y - US2Y).rename("SLOPE_2s10s")
-
 macro = pd.concat([
-    zscore_roll(VIX, 60),                # VIX_z60
-    diff1(US10Y),                        # dUS10Y_1d
-    zscore_roll(slope_2s10s, 60),        # SLOPE_2s10s_z60
+    zscore_roll(VIX, 60),               # VIX_z60
+    diff1(US10Y),                       # dUS10Y_1d
+    zscore_roll(slope_2s10s, 60),       # SLOPE_2s10s_z60
 ], axis=1)
 
-# Align price with macro (forward-fill macro for missing market holidays)
+# Align price with macro on a common calendar; forward-fill macro gaps
 data = price.join(macro, how="left").ffill()
 
 # -----------------------------
@@ -168,23 +177,21 @@ data["range"]    = (data["High"] / data["Low"]) - 1.0
 data["rv20"]     = np.sqrt((data["logret"]**2).rolling(20, min_periods=20).sum())
 data["ret_20d"]  = np.log(data["Close"] / data["Close"].shift(20))
 
-# Final clean-up (drop initial NaNs from rolling operations)
+# Final clean-up (drop NaNs from rolling/z-score windows)
 data = data.dropna()
 
 # -----------------------------
-# Assemble HMM feature matrix (order explicit)
+# Assemble HMM feature matrix (explicit order)
 # -----------------------------
 feature_cols = [
-    "logret",            # interpretable, first dim
-    "range",             # intraday vol proxy
-    "rv20",              # realized vol
+    "logret",            # interpretable, kept raw
+    "range",             # intraday volatility proxy
+    "rv20",              # realized volatility (20d)
     "ret_20d",           # medium-term momentum
     "VIX_z60",           # normalized market stress
     "SLOPE_2s10s_z60",   # normalized curve slope
     "dUS10Y_1d",         # yield impulse
 ]
-# Ensure columns exist (zscore functions set names accordingly)
-# If any column missing due to insufficient history, stop explicitly
 for col in feature_cols:
     if col not in data.columns:
         st.error(f"Falta la columna requerida: {col}. Amplía el rango temporal.")
@@ -193,7 +200,7 @@ for col in feature_cols:
 X = data[feature_cols].to_numpy()
 
 # -----------------------------
-# Train HMM (2 states, diagonal cov for stability)
+# Train HMM (2 states, diagonal covariance)
 # -----------------------------
 model = hmm.GaussianHMM(
     n_components=2,
@@ -205,7 +212,6 @@ model = hmm.GaussianHMM(
 )
 model.fit(X)
 
-# Hidden states and probabilities
 states = pd.Series(model.predict(X), index=data.index, name="state")
 proba  = pd.DataFrame(model.predict_proba(X), index=data.index, columns=[f"p_state_{i}" for i in range(model.n_components)])
 
@@ -224,7 +230,7 @@ p_bull = proba[f"p_state_{bull_state}"].rename("p_bull")
 sig_hyst = hysteresis_binary(p_bull, PROBA_ENTER, PROBA_EXIT)
 sig_smooth = enforce_min_dwell(sig_hyst, MIN_DWELL).rename("signal")
 
-# Execute at next bar: shift by 1
+# Execute at next bar: shift by 1 (no look-ahead)
 signal_exec = sig_smooth.shift(1).fillna(0.0)
 
 # -----------------------------
@@ -239,7 +245,7 @@ ratio_vs_bh = strat_curve.loc[last_label] / bh_curve.loc[last_label]
 st.write(f"HMM/B&H (señal suavizada): {ratio_vs_bh:.2f}")
 
 # -----------------------------
-# Deterministic forecast (argmax transition path on states)
+# Deterministic forecast (argmax transition path)
 # -----------------------------
 last_date = data.index[-1]
 last_close = data.loc[last_date, "Close"]
@@ -264,7 +270,7 @@ pred_index = pd.date_range(start=last_date + pd.DateOffset(days=1),
 predicted = pd.Series(pred_prices, index=pred_index, name="pred_close")
 
 # -----------------------------
-# Plot: last 3000 points + forecast, log-y, green bull / red bear
+# Plot: last 3000 points + forecast, log-y, green=bull, red=bear
 # -----------------------------
 fig = go.Figure()
 
