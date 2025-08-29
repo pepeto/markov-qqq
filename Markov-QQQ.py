@@ -1,14 +1,16 @@
 """
-HMM minimalista (Stooq, daily) — 2 features, 2 estados
+HMM minimalista (Stooq, daily) — ensemble 5 semillas (mediana), covarianza full
 - Features:
-    1) logret = log(C_t / C_{t-1})          [drift interpretable]
+    1) logret = log(C_t / C_{t-1})          [interpretable drift]
     2) range  = (H_t / L_t) - 1             [intraday volatility proxy]
 - Modelo:
     GaussianHMM(n_components=2, covariance_type="full")
+    Ensemble: seeds = [11, 17, 23, 42, 73]; combinar con mediana de P(bull)
+    Bull = estado con mayor media en logret
 - Backtest:
-    Señal long/flat = (state == bull_state), ejecución a barra siguiente (shift +1)
+    Señal long/flat = (median P(bull) > 0.5), ejecución a barra siguiente (shift +1)
 - Plot:
-    Eje Y logarítmico, verde=alcista, rojo=bajista
+    Eje Y logarítmico, verde=alcista, rojo=bajista (etiquetas del mejor modelo)
 - Estilo:
     Sin try/except, sin iloc. Comentarios en inglés; UI en español.
 """
@@ -24,7 +26,7 @@ from pandas_datareader.data import DataReader
 # UI mínima
 # -----------------------------
 st.set_page_config(layout="wide")
-st.title("HMM minimalista (Stooq) — 2 features, 2 estados")
+st.title("HMM minimalista (Stooq) — ensemble 5 semillas, covarianza full")
 
 ticker_in = st.text_input("Especie (Stooq)", "QQQ")
 forecast_horizon = int(st.number_input("Horizonte de predicción (días hábiles)", value=15, min_value=1, step=1))
@@ -66,56 +68,95 @@ data = data.dropna()
 X = data[["logret", "range"]].to_numpy()
 
 # -----------------------------
-# HMM (2 estados, covarianza full)
+# Ensemble de semillas (mediana de P(bull))
 # -----------------------------
-model = hmm.GaussianHMM(
-    n_components=2,
-    covariance_type="full",
-    n_iter=200,
-    tol=1e-2,
-    init_params="stmc",
-    random_state=42
-)
-model.fit(X)
+seeds = [11, 17, 23, 42, 73]
 
-states = pd.Series(model.predict(X), index=data.index, name="state")
-means = pd.DataFrame(model.means_, columns=["mu_logret", "mu_range"])
+p_bull_list = []
+ll_list = []
+models = []
+bull_states = []
 
-# Bull = estado con mayor media de logret
-bull_state = int(np.argmax(means["mu_logret"].values))
-bear_state = 1 - bull_state
+for rs in seeds:
+    m = hmm.GaussianHMM(
+        n_components=2,
+        covariance_type="full",
+        n_iter=200,
+        tol=1e-2,
+        init_params="stmc",
+        random_state=int(rs)
+    )
+    m.fit(X)
 
-st.write(f"Estados: 2 — Alcista: {bull_state + 1} — Convergió: {model.monitor_.converged} (iter={model.monitor_.iter})")
-st.write(f"μ(logret) por estado: {[f'{m:+.6f}' for m in means['mu_logret'].values]}")
+    mu = m.means_[:, 0]  # mean of logret per state
+    bull = int(np.argmax(mu))
+    bear = 1 - bull
+
+    # Descarta semillas sin polaridad (bull mean <= bear mean)
+    if mu[bull] <= mu[bear]:
+        continue
+
+    p_bull = m.predict_proba(X)[:, bull]
+    p_bull_list.append(pd.Series(p_bull, index=data.index))
+    ll_list.append(m.score(X))
+    models.append(m)
+    bull_states.append(bull)
+
+# Fallback si ninguna semilla superó el filtro (muy raro)
+if len(p_bull_list) == 0:
+    m = hmm.GaussianHMM(
+        n_components=2,
+        covariance_type="full",
+        n_iter=200,
+        tol=1e-2,
+        init_params="stmc",
+        random_state=42
+    )
+    m.fit(X)
+    mu = m.means_[:, 0]
+    bull = int(np.argmax(mu))
+    p_bull_med = pd.Series(m.predict_proba(X)[:, bull], index=data.index).rename("p_bull_med")
+    best_model = m
+    best_bull = bull
+else:
+    # Mediana de probabilidades P(bull) en el tiempo
+    p_bull_med = pd.concat(p_bull_list, axis=1).median(axis=1).rename("p_bull_med")
+    # Mejor modelo (para plot de estados y forecast) por máximo log-likelihood
+    best_idx = int(np.argmax(ll_list))
+    best_model = models[best_idx]
+    best_bull = bull_states[best_idx]
 
 # -----------------------------
-# Backtest vectorizado (long/flat), ejecución next bar
+# Señal y backtest (long/flat) — ejecución a próxima barra
 # -----------------------------
+signal = (p_bull_med > 0.5).astype(float).rename("signal")
+signal_exec = signal.shift(1).fillna(0.0)
+
 ret = data["Close"].pct_change().fillna(0.0)
-signal = (states == bull_state).astype(float).shift(1).fillna(0.0)
-
-strat_curve = (1.0 + signal * ret).cumprod()
+strat_curve = (1.0 + signal_exec * ret).cumprod()
 bh_curve = (1.0 + ret).cumprod()
 
 last_label = strat_curve.index[-1]
 ratio_vs_bh = strat_curve.loc[last_label] / bh_curve.loc[last_label]
-st.write(f"HMM/B&H: {ratio_vs_bh:.2f}")
+st.write(f"HMM/B&H (ensemble 5 semillas, mediana): {ratio_vs_bh:.2f}")
 
 # -----------------------------
-# Predicción determinista (argmax transición)
+# Estados y forecast usando el "mejor" modelo
 # -----------------------------
-last_date = data.index[-1]
-last_close = data.loc[last_date, "Close"]
-current_state = int(states.loc[last_date])
+states_best = pd.Series(best_model.predict(X), index=data.index, name="state_best")
 
-P = model.transmat_
-mu_logret_states = model.means_[:, 0]  # expected log-return per state
+P = best_model.transmat_
+mu_logret_states = best_model.means_[:, 0]
+current_state = int(states_best.loc[data.index[-1]])
 
 future_logrets = []
 s = current_state
 for _ in range(forecast_horizon):
     s = int(np.argmax(P[s]))
     future_logrets.append(mu_logret_states[s])
+
+last_date = data.index[-1]
+last_close = data.loc[last_date, "Close"]
 
 pred_prices = [float(last_close)]
 for r in future_logrets:
@@ -131,14 +172,15 @@ predicted = pd.Series(pred_prices, index=pred_index, name="pred_close")
 # -----------------------------
 fig = go.Figure()
 
-tail_n = min(3000, len(data))
+tail_n = min(1000, len(data))
 idx_tail = data.index[-tail_n:]
-states_tail = states.loc[idx_tail]
+states_tail = states_best.loc[idx_tail]
 
-state_colors = {bull_state: "green", bear_state: "red"}
-state_names  = {bull_state: "Régimen alcista", bear_state: "Régimen bajista"}
+bear_state = 1 - best_bull
+state_colors = {best_bull: "green", bear_state: "red"}
+state_names  = {best_bull: "Régimen alcista", bear_state: "Régimen bajista"}
 
-for i in [bear_state, bull_state]:
+for i in [bear_state, best_bull]:
     mask = (states_tail == i)
     x = idx_tail[mask]
     y = data.loc[idx_tail, "Close"][mask]
@@ -155,7 +197,7 @@ fig.add_trace(go.Scatter(
 ))
 
 fig.update_layout(
-    title=f"{SYMBOL} — HMM minimalista (2 features) y predicción determinista",
+    title=f"{SYMBOL} — HMM minimalista (ensemble 5 semillas) y predicción determinista",
     xaxis_title="Fecha",
     yaxis_title="Precio de cierre (log)",
     yaxis_type="log",
