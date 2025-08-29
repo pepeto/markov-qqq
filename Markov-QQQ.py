@@ -1,22 +1,22 @@
 """
-Minimal daily HMM with macro (all from Stooq)
+Minimal daily HMM with macro (all from Stooq; VIX replaced by robust SPY vol proxy)
 - Features (7 total, high-signal, low overfit):
-    1) logret            = log(C_t / C_{t-1})          [price drift; interpretable]
-    2) range             = (H_t / L_t) - 1             [intraday volatility proxy]
-    3) rv20              = sqrt(sum_{i=1..20} r_{t-i+1}^2)  [realized volatility]
-    4) ret_20d           = log(C_t / C_{t-20})         [medium-term momentum]
-    5) VIX_z60           = 60d z-score of Stooq VIX future (VI.F) [stress, normalized]
-    6) SLOPE_2s10s_z60   = 60d z-score of (US10Y - US2Y)        [macro cycle]
-    7) dUS10Y_1d         = daily change of US10Y yield          [rates impulse]
+    1) logret              = log(C_t / C_{t-1})                 [price drift; interpretable]
+    2) range               = (H_t / L_t) - 1                    [intraday volatility proxy]
+    3) rv20                = sqrt(sum_{i=1..20} r_{t-i+1}^2)    [realized volatility]
+    4) ret_20d             = log(C_t / C_{t-20})                [medium-term momentum]
+    5) VIXproxy_z60        = 60d z-score of SPY Parkinson vol   [market stress, normalized]
+    6) SLOPE_2s10s_z60     = 60d z-score of (US10Y - US2Y)      [macro cycle]
+    7) dUS10Y_1d           = daily change of US10Y              [rates impulse]
 
 - Data source (Stooq via pandas_datareader):
     * Price: user symbol (e.g., QQQ)
-    * VIX future:  VI.F
-    * US10Y:       10YUSY.B
-    * US2Y:        2YUSY.B
+    * SPY (for vol proxy)
+    * US10Y: 10YUSY.B
+    * US2Y : 2YUSY.B
 
 - Model:
-    * GaussianHMM(n_components=2, covariance_type="diag")  # stable
+    * GaussianHMM(n_components=2, covariance_type="diag") for stability
     * First feature kept as raw log-return for state interpretability
     * Signal smoothing:
         - Hysteresis on P(bull): enter > 0.60, exit < 0.40
@@ -44,7 +44,7 @@ from pandas_datareader.data import DataReader
 # Streamlit UI (minimal)
 # -----------------------------
 st.set_page_config(layout="wide")
-st.title("HMM minimalista (Stooq) con VIX y tasas")
+st.title("HMM minimalista (Stooq) con proxy de VIX y tasas")
 
 symbol_in = st.text_input("Especie (Stooq)", "QQQ")
 forecast_horizon = int(st.number_input("Horizonte de predicción (días hábiles)", value=15, min_value=1, step=1))
@@ -89,10 +89,10 @@ if len(price) < 200:
     st.error("Muy pocos datos para entrenar el HMM. Revisa el símbolo o rango temporal.")
     st.stop()
 
-# VIX future (as stress proxy), and US yields
-VIXF  = stooq_close("VI.F").rename("VIX")          # S&P 500 VIX future (Stooq symbol)
-US10Y = stooq_close("10YUSY.B").rename("US10Y")    # US 10Y yield
-US2Y  = stooq_close("2YUSY.B").rename("US2Y")      # US 2Y yield
+# SPY for volatility proxy; US yields for macro slope and impulse
+spy = stooq_ohlc("SPY")                         # SPY OHLC
+US10Y = stooq_close("10YUSY.B").rename("US10Y") # US 10Y yield
+US2Y  = stooq_close("2YUSY.B").rename("US2Y")   # US 2Y yield
 
 # -----------------------------
 # Feature helpers
@@ -146,13 +146,19 @@ def enforce_min_dwell(signal: pd.Series, min_bars: int) -> pd.Series:
     return out.rename("signal_dwell")
 
 # -----------------------------
-# Macro engineered series
+# SPY Parkinson volatility as VIX proxy
+# sigma_P^2 = (1 / (4 ln 2)) * [ln(H/L)]^2  -> daily sigma_P = sqrt(...)
 # -----------------------------
+ln_hl_spy = np.log(spy["High"] / spy["Low"])
+parkinson_var_spy = (1.0 / (4.0 * np.log(2.0))) * (ln_hl_spy ** 2)
+parkinson_vol_spy = np.sqrt(parkinson_var_spy).rename("PVOL_SPY")
+
+# Macro engineered series
 slope_2s10s = (US10Y - US2Y).rename("SLOPE_2s10s")
 macro = pd.concat([
-    zscore_roll(VIXF, 60),              # VIX_z60
-    diff1(US10Y),                       # dUS10Y_1d
-    zscore_roll(slope_2s10s, 60),       # SLOPE_2s10s_z60
+    zscore_roll(parkinson_vol_spy, 60).rename("VIXproxy_z60"),  # stress proxy
+    diff1(US10Y),                                               # dUS10Y_1d
+    zscore_roll(slope_2s10s, 60),                               # SLOPE_2s10s_z60
 ], axis=1)
 
 # Align price with macro; forward-fill macro gaps to trading calendar
@@ -177,7 +183,7 @@ feature_cols = [
     "range",             # intraday volatility proxy
     "rv20",              # realized volatility (20d)
     "ret_20d",           # medium-term momentum
-    "VIX_z60",           # normalized market stress (from VI.F)
+    "VIXproxy_z60",      # normalized stress proxy (SPY Parkinson vol)
     "SLOPE_2s10s_z60",   # normalized curve slope
     "dUS10Y_1d",         # yield impulse
 ]
@@ -288,7 +294,7 @@ fig.add_trace(go.Scatter(
 ))
 
 fig.update_layout(
-    title=f"{SYMBOL} — HMM (Stooq) con VIX/tasas y predicción determinista",
+    title=f"{SYMBOL} — HMM (Stooq) con proxy de VIX/tasas y predicción determinista",
     xaxis_title="Fecha",
     yaxis_title="Precio de cierre (log)",
     yaxis_type="log",
