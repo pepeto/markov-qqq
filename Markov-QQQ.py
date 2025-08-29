@@ -1,11 +1,22 @@
+"""
+Streamlit HMM (TA-Lib) app
+- Indicators computed with TA-Lib (EMA, WMA, RSI, WILLR, CCI, SMA).
+- Clean numeric inputs for TA-Lib (float64, C-contiguous) to avoid wrapper errors.
+- HMM on features with first dimension = raw log return (interpretable for forecasting).
+- Simple long/flat backtest with next-bar execution proxy (using next close).
+- No try/except blocks as requested. Comments concise and in English.
+"""
+
 import streamlit as st
-import talib as tl  # TA-Lib for technical indicators
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+import talib as tl
+
 from hmmlearn import hmm
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
 
 # -----------------------------
 # Streamlit page configuration
@@ -14,225 +25,290 @@ st.set_page_config(layout="wide")
 st.title('Análisis de Estados Ocultos con HMM (TA-Lib)')
 
 # -----------------------------
+# Helpers
+# -----------------------------
+def to_np_f64(series: pd.Series) -> np.ndarray:
+    """Coerce to numeric, cast to float64, and force C-contiguous layout for TA-Lib."""
+    arr = pd.to_numeric(series, errors='coerce').astype('float64').to_numpy()
+    return np.ascontiguousarray(arr)
+
+
+def compute_indicators(df: pd.DataFrame,
+                       sma_period: int,
+                       ema_period: int,
+                       wma_period: int,
+                       rsi_period: int,
+                       willr_period: int,
+                       cci_period: int) -> pd.DataFrame:
+    """Compute TA-Lib indicators and engineered features. Drops NaNs at the end."""
+    # Base arrays for TA-Lib (float64, contiguous)
+    open_np  = to_np_f64(df['Open'])
+    high_np  = to_np_f64(df['High'])
+    low_np   = to_np_f64(df['Low'])
+    close_np = to_np_f64(df['Close'])
+
+    # Base series
+    df['OHL'] = df['Close']
+    df['Log Return'] = np.log(df['OHL'] / df['OHL'].shift(1))
+
+    # Moving averages via TA-Lib
+    df['SMA'] = tl.SMA(close_np, timeperiod=int(sma_period))
+    df['EMA'] = tl.EMA(close_np, timeperiod=int(ema_period))
+    df['WMA'] = tl.WMA(close_np, timeperiod=int(wma_period))
+
+    # Log-returns of MAs (to capture MA dynamics)
+    df['SMA_log_return'] = np.log(df['SMA'] / df['SMA'].shift(1))
+    df['EMA_log_return'] = np.log(df['EMA'] / df['EMA'].shift(1))
+    df['WMA_log_return'] = np.log(df['WMA'] / df['WMA'].shift(1))
+
+    # Oscillators via TA-Lib
+    df['RSI']   = tl.RSI(close_np, timeperiod=int(rsi_period))
+    df['WILLR'] = tl.WILLR(high_np, low_np, close_np, timeperiod=int(willr_period))  # [-100, 0]
+    df['CCI']   = tl.CCI(high_np, low_np, close_np, timeperiod=int(cci_period))
+
+    # Intraday range (optionally replace by log-range if desired)
+    df['Range'] = (df['High'] / df['Low']) - 1.0
+
+    # Replace infs and drop NaNs introduced by indicators
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+    return df
+
+
+def scale_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Scale selected features; keep raw log return as the first HMM dimension."""
+    sma_scaler   = StandardScaler()
+    ema_scaler   = StandardScaler()
+    wma_scaler   = StandardScaler()
+    rsi_scaler   = MinMaxScaler()
+    willr_scaler = MinMaxScaler()
+    cci_scaler   = MinMaxScaler()
+
+    df['sma_scaled']   = sma_scaler.fit_transform(df[['SMA_log_return']]).ravel()
+    df['ema_scaled']   = ema_scaler.fit_transform(df[['EMA_log_return']]).ravel()
+    df['wma_scaled']   = wma_scaler.fit_transform(df[['WMA_log_return']]).ravel()
+    df['rsi_scaled']   = rsi_scaler.fit_transform(df[['RSI']]).ravel()
+    df['willr_scaled'] = willr_scaler.fit_transform(df[['WILLR']]).ravel()
+    df['cci_scaled']   = cci_scaler.fit_transform(df[['CCI']]).ravel()
+    return df
+
+
+def train_hmm(X: np.ndarray, n_components: int = 2, random_state: int = 42) -> hmm.GaussianHMM:
+    """Train a GaussianHMM with interpretable first dimension (raw log return)."""
+    model = hmm.GaussianHMM(
+        algorithm='map',
+        n_components=int(n_components),
+        covariance_type='full',
+        n_iter=300,
+        tol=1e-2,
+        init_params='stmc',
+        random_state=int(random_state)
+    )
+    model.fit(X)
+    return model
+
+
+def map_bull_bear_by_mean_logreturn(model: hmm.GaussianHMM) -> int:
+    """Return the state index considered 'bull' (max mean on first feature)."""
+    means = model.means_  # shape: (n_components, n_features)
+    bull_state = int(np.argmax(means[:, 0]))
+    return bull_state
+
+
+def backtest_long_flat(close: pd.Series,
+                       states: np.ndarray,
+                       bull_state: int,
+                       commission_factor: float = 1 - 0.04/100,
+                       initial_cash: float = 100.0,
+                       verbose: bool = False) -> float:
+    """
+    Simple long/flat strategy:
+      - Long when state == bull_state, else flat.
+      - Executes at next bar's close (proxy).
+    Returns ratio vs. Buy & Hold.
+    """
+    # Alignment checks
+    assert isinstance(close, pd.Series)
+    assert len(close) == len(states)
+
+    dates = close.index
+    first_date = dates[0]
+    last_date  = dates[-1]
+
+    cash = float(initial_cash)
+    shares = 0.0
+    in_pos = False
+    operations = 0
+
+    # Buy & Hold benchmark
+    bh_shares = initial_cash / close.loc[first_date]
+    bh_final = bh_shares * close.loc[last_date]
+
+    # Iterate through bars (execute on next bar)
+    for i in range(len(dates) - 1):
+        d_now = dates[i]
+        d_next = dates[i + 1]
+        go_long = (states[i] == bull_state)
+
+        if go_long and (not in_pos):
+            price = close.loc[d_next]
+            shares = (cash * commission_factor) / price
+            cash = 0.0
+            in_pos = True
+            operations += 1
+        elif (not go_long) and in_pos:
+            price = close.loc[d_next]
+            cash = shares * price * commission_factor
+            shares = 0.0
+            in_pos = False
+            operations += 1
+
+    final_value = cash + shares * close.loc[last_date]
+    ratio_vs_bh = final_value / bh_final
+
+    if verbose:
+        st.write(f'Operaciones: {operations}')
+        st.write(f'B&H final: {bh_final:.2f} — Estrategia final: {final_value:.2f}')
+
+    return ratio_vs_bh
+
+
+def forecast_prices_by_means(model: hmm.GaussianHMM,
+                             last_close: float,
+                             current_state: int,
+                             horizon: int = 15) -> pd.Series:
+    """
+    Deterministic forecast using argmax transition path:
+      - At each step pick next state = argmax row of transition matrix.
+      - Use mean of first feature (log-return) to propagate prices.
+    """
+    transition = model.transmat_
+    means = model.means_
+
+    state = int(current_state)
+    preds = []
+    for _ in range(int(horizon)):
+        nxt = int(np.argmax(transition[state]))
+        preds.append(means[nxt, 0])  # expected log-return for that state
+        state = nxt
+
+    prices = [float(last_close)]
+    for r in preds:
+        prices.append(prices[-1] * np.exp(r))
+
+    # Build a business-day index forward from last date (to be assigned by caller)
+    prices = prices[1:]  # drop seed
+    return pd.Series(prices)
+
+
+# -----------------------------
 # Inputs
 # -----------------------------
-especie = st.text_input('Especie', 'QQQ')
-sma_period = st.number_input('Período de SMA', value=44, min_value=1, step=1)
-ema_period = st.number_input('Período de EMA', value=30, min_value=1, step=1)
-wma_period = st.number_input('Período de WMA', value=52, min_value=1, step=1)
-rsi_period = st.number_input('Período de RSI', value=14, min_value=1, step=1)
-willr_period = st.number_input('Período de WILLR', value=14, min_value=1, step=1)
-cci_period = st.number_input('Período de CCI', value=20, min_value=1, step=1)
+ticker = st.text_input('Especie', 'QQQ')
+sma_period = int(st.number_input('Período de SMA', value=44, min_value=1, step=1))
+ema_period = int(st.number_input('Período de EMA', value=30, min_value=1, step=1))
+wma_period = int(st.number_input('Período de WMA', value=52, min_value=1, step=1))
+rsi_period = int(st.number_input('Período de RSI', value=14, min_value=1, step=1))
+willr_period = int(st.number_input('Período de WILLR', value=14, min_value=1, step=1))
+cci_period = int(st.number_input('Período de CCI', value=20, min_value=1, step=1))
+hmm_states = int(st.number_input('Número de estados HMM', value=2, min_value=2, max_value=8, step=1))
+forecast_horizon = int(st.number_input('Horizonte de predicción (días hábiles)', value=15, min_value=1, step=1))
 
 # -----------------------------
 # Data download
 # -----------------------------
-# NOTE: You currently use yfinance; if desired, you can switch to pandas_datareader "stooq"
-# for your usual workflow. Kept yfinance here to minimize changes around Streamlit inputs.
-data = yf.download(especie, start="1970-01-01", end="2025-05-03")
+data = yf.download(ticker, start="1970-01-01", end="2025-05-03", auto_adjust=False)
 st.write(f'Longitud de los datos descargados: {len(data)}')
 
-# Defensive check
 if data.empty:
     st.error("No se descargaron datos. Verifica el ticker o el rango de fechas.")
     st.stop()
 
+# Ensure datetime index is sorted ascending
+data = data.sort_index()
+
 # -----------------------------
-# Feature construction (TA-Lib)
+# Indicators and features
 # -----------------------------
-# We keep a single 'OHL' series (close) and compute log-returns in original scale.
-data['OHL'] = data['Close']
-data['Log Return'] = np.log(data['OHL'] / data['OHL'].shift(1))
-
-# Moving averages via TA-Lib
-data['SMA'] = tl.SMA(data['OHL'].to_numpy(), timeperiod=int(sma_period))
-data['EMA'] = tl.EMA(data['OHL'].to_numpy(), timeperiod=int(ema_period))
-data['WMA'] = tl.WMA(data['OHL'].to_numpy(), timeperiod=int(wma_period))
-
-# Log-returns of MAs (these will be standardized individually)
-data['SMA_log_return'] = np.log(data['SMA'] / data['SMA'].shift(1))
-data['EMA_log_return'] = np.log(data['EMA'] / data['EMA'].shift(1))
-data['WMA_log_return'] = np.log(data['WMA'] / data['WMA'].shift(1))
-
-# Momentum/Oscillators via TA-Lib
-data['RSI']   = tl.RSI(data['OHL'].to_numpy(), timeperiod=int(rsi_period))
-data['WILLR'] = tl.WILLR(
-    data['High'].to_numpy(),
-    data['Low'].to_numpy(),
-    data['Close'].to_numpy(),
-    timeperiod=int(willr_period)
+data = compute_indicators(
+    df=data.copy(),
+    sma_period=sma_period,
+    ema_period=ema_period,
+    wma_period=wma_period,
+    rsi_period=rsi_period,
+    willr_period=willr_period,
+    cci_period=cci_period
 )
-data['CCI']   = tl.CCI(
-    data['High'].to_numpy(),
-    data['Low'].to_numpy(),
-    data['Close'].to_numpy(),
-    timeperiod=int(cci_period)
-)
+data = scale_features(data)
 
-# Intraday range (kept unscaled; you may consider log-range)
-data['Range'] = (data['High'] / data['Low']) - 1.0
-
-# Drop NaN rows produced by indicators
-data = data.dropna()
-
-# -----------------------------
-# Scaling (feature-wise)
-# -----------------------------
-# NOTE: 'Log Return' is kept in original scale to be the first HMM dimension.
-# Each scaled column uses its own scaler to avoid cross-contamination.
-sma_scaler = StandardScaler()
-ema_scaler = StandardScaler()
-wma_scaler = StandardScaler()
-
-rsi_scaler    = MinMaxScaler()
-willr_scaler  = MinMaxScaler()
-cci_scaler    = MinMaxScaler()
-
-data['sma_scaled']   = sma_scaler.fit_transform(data[['SMA_log_return']]).ravel()
-data['ema_scaled']   = ema_scaler.fit_transform(data[['EMA_log_return']]).ravel()
-data['wma_scaled']   = wma_scaler.fit_transform(data[['WMA_log_return']]).ravel()
-
-# RSI is naturally in [0, 100]; WILLR is in [-100, 0]; CCI is unbounded (often within ±200)
-# We normalize each to [0, 1] for numerical stability in HMM.
-data['rsi_scaled']   = rsi_scaler.fit_transform(data[['RSI']]).ravel()
-data['willr_scaled'] = willr_scaler.fit_transform(data[['WILLR']]).ravel()
-data['cci_scaled']   = cci_scaler.fit_transform(data[['CCI']]).ravel()
-
-# -----------------------------
-# HMM training
-# -----------------------------
-# Feature matrix: first column = raw log-return (important for prediction)
+# Feature matrix for HMM
 feature_cols = ['Log Return', 'sma_scaled', 'cci_scaled', 'willr_scaled', 'ema_scaled', 'Range']
 X = data[feature_cols].to_numpy()
 
-# HMM with reproducibility
-model = hmm.GaussianHMM(
-    algorithm='map',
-    n_components=2,
-    covariance_type='full',
-    n_iter=300,
-    tol=1e-2,
-    init_params='stmc',
-    random_state=42
-)
-model.fit(X)
-
+# -----------------------------
+# Train HMM
+# -----------------------------
+model = train_hmm(X, n_components=hmm_states, random_state=42)
 hidden_states = model.predict(X)
 log_likelihood = model.score(X)
 
-st.write(f'Converged: {model.monitor_.converged} — Iterations: {model.monitor_.iter}')
+# Report convergence
+st.write(f'Converge: {model.monitor_.converged} — Iteraciones: {model.monitor_.iter}')
 st.write(f'Log Likelihood: {log_likelihood:.0f}')
 
+# Determine bull state by mean log-return
+bull_state = map_bull_bear_by_mean_logreturn(model)
+means_first_dim = model.means_[:, 0]
+st.write(f'Estado bull (por media de log-return): {bull_state + 1}')
+for i in range(model.n_components):
+    st.write(f"μ_logret(Estado {i+1}): {means_first_dim[i]:+.6f}")
+
 # -----------------------------
-# Backtest
+# Backtest (long/flat)
 # -----------------------------
-def BackTest(close_series: pd.Series, states: np.ndarray, inversion: bool = False,
-             comision: float = 1 - 0.04/100, capital_inicial: float = 100.0, verbose: int = 0) -> float:
-    """
-    Simple long/flat strategy driven by state:
-    - If (state == 1) XOR inversion -> long; else -> flat.
-    - Uses next day's open-price proxy = next close (since we only have close), solely for consistency with your original approach.
-    """
-    # Ensure alignment
-    if len(close_series) != len(states):
-        raise ValueError("States length must match close series length.")
-
-    dates = close_series.index
-    first_date = dates[0]
-    last_date  = dates[-1]
-
-    cash = capital_inicial
-    shares = 0.0
-    bought = False
-    operations = 0
-
-    # Buy & Hold benchmark
-    bh_shares = capital_inicial / close_series.loc[first_date]
-    bh_final_value = bh_shares * close_series.loc[last_date]
-
-    for i in range(len(dates) - 1):
-        d_now = dates[i]
-        d_next = dates[i + 1]
-
-        go_long = (states[i] == 1)
-        if inversion:
-            go_long = not go_long
-
-        if go_long and not bought:
-            # Buy at next bar price proxy
-            price = close_series.loc[d_next]
-            shares = (cash * comision) / price
-            cash = 0.0
-            bought = True
-            operations += 1
-        elif (not go_long) and bought:
-            # Sell at next bar price proxy
-            price = close_series.loc[d_next]
-            cash = shares * price * comision
-            shares = 0.0
-            bought = False
-            operations += 1
-
-    final_value = cash + shares * close_series.loc[last_date]
-    ratio_vs_bh = final_value / bh_final_value
-
-    if verbose == 1:
-        st.write(f'B&H final value: {bh_final_value:.2f}')
-        st.write(f'Operations: {operations}')
-
-    return ratio_vs_bh
-
 st.write('* BackTest *')
-ratio_normal = BackTest(data['Close'], hidden_states, inversion=False, verbose=1)
-ratio_inverse = BackTest(data['Close'], hidden_states, inversion=True,  verbose=0)
-st.write(f'HMM/B&H (mejor de long/short-invertido): {max(ratio_normal, ratio_inverse):.2f}')
+ratio_vs_bh = backtest_long_flat(
+    close=data['Close'],
+    states=hidden_states,
+    bull_state=bull_state,
+    commission_factor=(1 - 0.04/100),
+    initial_cash=100.0,
+    verbose=True
+)
+st.write(f'HMM/B&H: {ratio_vs_bh:.2f}')
 
 # -----------------------------
-# One-step-ahead "most likely" path forecast (deterministic via argmax)
+# Forecast
 # -----------------------------
-transition = model.transmat_
-means = model.means_       # shape: (n_components, n_features)
-covars = model.covars_     # kept for completeness
-
-current_state = hidden_states[-1]
-predicted_states = [current_state]
-horizon = 15
-
-for _ in range(horizon):
-    next_state = int(np.argmax(transition[current_state]))
-    predicted_states.append(next_state)
-    current_state = next_state
-
-# Use the first feature mean (raw log return) for projection
-predicted_log_returns = [means[s, 0] for s in predicted_states[1:]]
-
 last_date = data.index[-1]
 last_close = data.loc[last_date, 'OHL']
+current_state = int(hidden_states[-1])
+st.write(f'Último estado observado: {current_state + 1} (fecha {last_date.date()})')
 
-predicted_prices = [last_close]
-for r in predicted_log_returns:
-    # Price_{t+1} = Price_t * exp(log-return)
-    predicted_prices.append(predicted_prices[-1] * np.exp(r))
-
+pred_series = forecast_prices_by_means(
+    model=model,
+    last_close=float(last_close),
+    current_state=current_state,
+    horizon=forecast_horizon
+)
 pred_index = pd.date_range(start=last_date + pd.DateOffset(days=1),
-                           periods=len(predicted_log_returns),
+                           periods=len(pred_series),
                            freq='B')
-predicted_df = pd.DataFrame({'OHL': predicted_prices[1:]}, index=pred_index)
+predicted_df = pd.DataFrame({'OHL': pred_series.values}, index=pred_index)
 
 # -----------------------------
-# Plot (last N points + forecast)
+# Plot (tail + forecast)
 # -----------------------------
-colors = ['red', 'green', 'blue', 'purple', 'orange']
+colors = ['red', 'green', 'blue', 'purple', 'orange', 'cyan', 'magenta', 'yellow']
 fig = go.Figure()
 
 tail = min(6000, len(data))
-idx_tail = data.index[-tail:]
+tail_df = data.tail(tail)
 states_tail = hidden_states[-tail:]
 
 for i in range(model.n_components):
     mask = (states_tail == i)
-    x = idx_tail[mask]
-    y = data.loc[idx_tail, 'OHL'].to_numpy()[mask]
+    x = tail_df.index[mask]
+    y = tail_df['OHL'].to_numpy()[mask]
     fig.add_trace(go.Scatter(
         x=x, y=y,
         mode='markers',
@@ -250,7 +326,7 @@ fig.add_trace(go.Scatter(
 ))
 
 fig.update_layout(
-    title=f'Precio de cierre de {especie}: estados ocultos y proyección (HMM)',
+    title=f'Precio de cierre de {ticker}: estados ocultos y proyección (HMM)',
     xaxis_title='Fecha',
     yaxis_title='Precio de cierre (log)',
     yaxis_type='log',
