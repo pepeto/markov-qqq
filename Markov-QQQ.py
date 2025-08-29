@@ -1,3 +1,36 @@
+"""
+Minimal HMM (daily) with macro features from Stooq
+- Goal: maximize backtest stability with few, meaningful features to avoid overfitting.
+- Features used (7 total):
+    1) logret        = log(C_t / C_{t-1})          [price drift; interpretable]
+    2) range         = (H_t / L_t) - 1             [intraday volatility proxy]
+    3) rv20          = sqrt(sum_{i=1..20} r_{t-i+1}^2)  [realized volatility]
+    4) ret_20d       = log(C_t / C_{t-20})         [medium-term momentum]
+    5) VIX_z60       = z-score 60d of VIX          [market stress, normalized]
+    6) SLOPE_2s10s_z60 = z-score 60d of 10Y-2Y     [macro cycle / risk regime]
+    7) dUS10Y_1d     = daily change of US10Y yield [rates impulse]
+
+- Data source: Stooq via pandas_datareader
+    * Price: user ticker (e.g., QQQ)
+    * VIX:   "VI.F"
+    * 10Y:   "10YUSY.B"
+    * 2Y:    "2YUSY.B"
+
+- Modeling:
+    * GaussianHMM(n_components=2, covariance_type="diag") for robustness
+    * First feature kept as raw log-return for interpretability (state means)
+    * Signal smoothing to reduce noise:
+        - Hysteresis on bull probability: enter > 0.60, exit < 0.40
+        - Minimum dwell time: require >= 3 days before switching regime
+
+- Plot:
+    * y-axis logarithmic
+    * bull regime in green, bear in red
+    * deterministic forecast via argmax transition for next N business days
+
+- No try/except, no .iloc (use .loc and index labels), comments in English.
+"""
+
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -6,93 +39,220 @@ from hmmlearn import hmm
 from pandas_datareader.data import DataReader
 
 # -----------------------------
-# UI mínima
+# Streamlit UI (minimal)
 # -----------------------------
 st.set_page_config(layout="wide")
-st.title("HMM minimalista con Stooq (2 estados)")
+st.title("HMM minimalista (Stooq) con macro: VIX y tasas")
 
-ticker_in = st.text_input("Especie", "QQQ")
+symbol_in = st.text_input("Especie (Stooq)", "QQQ")
 forecast_horizon = int(st.number_input("Horizonte de predicción (días hábiles)", value=15, min_value=1, step=1))
 
-# Normalizar símbolo (Stooq suele aceptar mayúsculas)
-symbol = ticker_in.strip().upper()
+# Smoothing hyperparameters (kept simple, fixed values)
+PROBA_ENTER = 0.60   # enter long if P(bull) > 0.60
+PROBA_EXIT  = 0.40   # exit long if P(bull) < 0.40
+MIN_DWELL   = 3      # minimum bars in a regime before switching
+
+# Normalize symbol (Stooq tickers usually uppercase)
+SYMBOL = symbol_in.strip().upper()
 
 # -----------------------------
-# Fechas: 1900 -> mañana (naive dates, SIN timezone)
+# Date range: 1900 -> tomorrow (naive dates; no timezone)
 # -----------------------------
 start_date = pd.Timestamp(1900, 1, 1).date()
 end_date = (pd.Timestamp.utcnow().floor("D") + pd.Timedelta(days=1)).date()
 
 # -----------------------------
-# Descarga desde Stooq
+# Data loaders (Stooq)
 # -----------------------------
-data = DataReader(symbol, "stooq", start=start_date, end=end_date)
-data = data.sort_index()
+def stooq_ohlc(symbol: str) -> pd.DataFrame:
+    """Download OHLC from Stooq, ascending index."""
+    df = DataReader(symbol, "stooq", start=start_date, end=end_date)
+    df = df.sort_index()
+    return df
 
-# Stooq ya entrega columnas 'Open','High','Low','Close','Volume' (title case)
+def stooq_close(symbol: str) -> pd.Series:
+    """Download 'Close' series from Stooq, ascending index."""
+    df = stooq_ohlc(symbol)
+    s = df["Close"].rename(symbol)
+    return s
+
+# -----------------------------
+# Download price and macro series
+# -----------------------------
+price = stooq_ohlc(SYMBOL)
+
 needed = {"Open", "High", "Low", "Close"}
-if not needed.issubset(set(data.columns)):
-    st.error("Faltan columnas OHLC en los datos de Stooq.")
+if not needed.issubset(set(price.columns)):
+    st.error("Faltan columnas OHLC en los datos de Stooq para el símbolo elegido.")
     st.stop()
 
-if len(data) < 100:
-    st.error("Muy pocos datos. Revisá el ticker o el rango temporal.")
+if len(price) < 200:
+    st.error("Muy pocos datos para entrenar el HMM. Revisa el símbolo o rango temporal.")
     st.stop()
 
+# Macro symbols from Stooq
+VIX   = stooq_close("VI.F").rename("VIX")
+US10Y = stooq_close("10YUSY.B").rename("US10Y")
+US2Y  = stooq_close("2YUSY.B").rename("US2Y")
+
 # -----------------------------
-# Features mínimas
+# Feature engineering helpers
 # -----------------------------
-data["logret"] = np.log(data["Close"] / data["Close"].shift(1))
-data["range"] = (data["High"] / data["Low"]) - 1.0
+def zscore_roll(s: pd.Series, win: int = 60) -> pd.Series:
+    """Rolling z-score with specified window (min_periods=win)."""
+    mean = s.rolling(win, min_periods=win).mean()
+    std  = s.rolling(win, min_periods=win).std(ddof=0)
+    z = (s - mean) / std
+    return z.rename(f"{s.name}_z{win}")
+
+def diff1(s: pd.Series) -> pd.Series:
+    """Simple first difference."""
+    return s.diff(1).rename(f"d{s.name}_1d")
+
+def hysteresis_binary(proba: pd.Series, upper: float, lower: float) -> pd.Series:
+    """
+    Convert probability series to binary signal with hysteresis:
+      - If prev==0 and proba>upper: switch to 1
+      - If prev==1 and proba<lower: switch to 0
+      - Else: keep previous
+    """
+    out = pd.Series(index=proba.index, dtype="float64")
+    prev = 0.0
+    for dt in proba.index:
+        p = float(proba.loc[dt])
+        if prev == 0.0 and p > upper:
+            prev = 1.0
+        elif prev == 1.0 and p < lower:
+            prev = 0.0
+        out.loc[dt] = prev
+    return out.rename("signal_hyst")
+
+def enforce_min_dwell(signal: pd.Series, min_bars: int) -> pd.Series:
+    """
+    Enforce minimum dwell time on a binary signal:
+      - A regime switch only confirmed after 'min_bars' consecutive bars in new state.
+    """
+    out = pd.Series(index=signal.index, dtype="float64")
+    current = 0.0
+    counter = 0
+    for dt in signal.index:
+        s = float(signal.loc[dt])
+        if s == current:
+            counter = counter + 1
+        else:
+            counter = 1
+        if counter >= min_bars:
+            current = s
+        out.loc[dt] = current
+    return out.rename("signal_dwell")
+
+# -----------------------------
+# Build macro DataFrame
+# -----------------------------
+slope_2s10s = (US10Y - US2Y).rename("SLOPE_2s10s")
+
+macro = pd.concat([
+    zscore_roll(VIX, 60),                # VIX_z60
+    diff1(US10Y),                        # dUS10Y_1d
+    zscore_roll(slope_2s10s, 60),        # SLOPE_2s10s_z60
+], axis=1)
+
+# Align price with macro (forward-fill macro for missing market holidays)
+data = price.join(macro, how="left").ffill()
+
+# -----------------------------
+# Price features (minimal)
+# -----------------------------
+data["logret"]   = np.log(data["Close"] / data["Close"].shift(1))
+data["range"]    = (data["High"] / data["Low"]) - 1.0
+data["rv20"]     = np.sqrt((data["logret"]**2).rolling(20, min_periods=20).sum())
+data["ret_20d"]  = np.log(data["Close"] / data["Close"].shift(20))
+
+# Final clean-up (drop initial NaNs from rolling operations)
 data = data.dropna()
 
-X = data[["logret", "range"]].to_numpy()
+# -----------------------------
+# Assemble HMM feature matrix (order explicit)
+# -----------------------------
+feature_cols = [
+    "logret",            # interpretable, first dim
+    "range",             # intraday vol proxy
+    "rv20",              # realized vol
+    "ret_20d",           # medium-term momentum
+    "VIX_z60",           # normalized market stress
+    "SLOPE_2s10s_z60",   # normalized curve slope
+    "dUS10Y_1d",         # yield impulse
+]
+# Ensure columns exist (zscore functions set names accordingly)
+# If any column missing due to insufficient history, stop explicitly
+for col in feature_cols:
+    if col not in data.columns:
+        st.error(f"Falta la columna requerida: {col}. Amplía el rango temporal.")
+        st.stop()
+
+X = data[feature_cols].to_numpy()
 
 # -----------------------------
-# HMM 2 estados
+# Train HMM (2 states, diagonal cov for stability)
 # -----------------------------
 model = hmm.GaussianHMM(
     n_components=2,
-    covariance_type="full",
-    n_iter=200,
+    covariance_type="diag",
+    n_iter=300,
     tol=1e-2,
     init_params="stmc",
     random_state=42
 )
 model.fit(X)
 
+# Hidden states and probabilities
 states = pd.Series(model.predict(X), index=data.index, name="state")
-mu_logret = model.means_[:, 0]
-bull_state = int(np.argmax(mu_logret))
+proba  = pd.DataFrame(model.predict_proba(X), index=data.index, columns=[f"p_state_{i}" for i in range(model.n_components)])
 
-st.write(f"Estados: 2 — Estado bull: {bull_state + 1}")
-st.write(f"μ_logret por estado: {[f'{m:+.6f}' for m in mu_logret]}")
+# Identify bull state by highest mean on first feature (logret)
+mu = pd.DataFrame(model.means_, columns=feature_cols)
+bull_state = int(np.argmax(mu["logret"].values))
+bear_state = 1 - bull_state  # valid for K=2
+
+st.write(f"Estados HMM: 2 — Estado alcista: {bull_state + 1} — Convergió: {model.monitor_.converged} (iter={model.monitor_.iter})")
+st.write(f"μ(logret) por estado: {[f'{m:+.6f}' for m in mu['logret'].values]}")
 
 # -----------------------------
-# Backtest vectorizado (long/flat)
+# Smoothed trading signal (hysteresis + min dwell)
+# -----------------------------
+p_bull = proba[f"p_state_{bull_state}"].rename("p_bull")
+sig_hyst = hysteresis_binary(p_bull, PROBA_ENTER, PROBA_EXIT)
+sig_smooth = enforce_min_dwell(sig_hyst, MIN_DWELL).rename("signal")
+
+# Execute at next bar: shift by 1
+signal_exec = sig_smooth.shift(1).fillna(0.0)
+
+# -----------------------------
+# Vectorized backtest (long/flat)
 # -----------------------------
 ret = data["Close"].pct_change().fillna(0.0)
-signal = (states == bull_state).astype(float).shift(1).fillna(0.0)
-
-strat_curve = (1.0 + signal * ret).cumprod()
+strat_curve = (1.0 + signal_exec * ret).cumprod()
 bh_curve = (1.0 + ret).cumprod()
+
 last_label = strat_curve.index[-1]
 ratio_vs_bh = strat_curve.loc[last_label] / bh_curve.loc[last_label]
-st.write(f"HMM/B&H: {ratio_vs_bh:.2f}")
+st.write(f"HMM/B&H (señal suavizada): {ratio_vs_bh:.2f}")
 
 # -----------------------------
-# Predicción determinista (argmax transición)
+# Deterministic forecast (argmax transition path on states)
 # -----------------------------
 last_date = data.index[-1]
 last_close = data.loc[last_date, "Close"]
 current_state = int(states.loc[last_date])
 
 P = model.transmat_
+mu_logret_states = model.means_[:, 0]  # expected log-return per state
+
 future_logrets = []
 s = current_state
 for _ in range(forecast_horizon):
     s = int(np.argmax(P[s]))
-    future_logrets.append(mu_logret[s])
+    future_logrets.append(mu_logret_states[s])
 
 pred_prices = [float(last_close)]
 for r in future_logrets:
@@ -104,7 +264,7 @@ pred_index = pd.date_range(start=last_date + pd.DateOffset(days=1),
 predicted = pd.Series(pred_prices, index=pred_index, name="pred_close")
 
 # -----------------------------
-# Gráfico (últimos 3000 + pred)
+# Plot: last 3000 points + forecast, log-y, green bull / red bear
 # -----------------------------
 fig = go.Figure()
 
@@ -112,11 +272,10 @@ tail_n = min(3000, len(data))
 idx_tail = data.index[-tail_n:]
 states_tail = states.loc[idx_tail]
 
-# Mapear colores y nombres: bull -> verde, bear -> rojo
-bear_state = 1 - bull_state  # válido porque son 2 estados
 state_colors = {bull_state: "green", bear_state: "red"}
 state_names  = {bull_state: "Régimen alcista", bear_state: "Régimen bajista"}
 
+# Bear first, then Bull (legend ordering)
 for i in [bear_state, bull_state]:
     mask = (states_tail == i)
     x = idx_tail[mask]
@@ -134,7 +293,7 @@ fig.add_trace(go.Scatter(
 ))
 
 fig.update_layout(
-    title=f"{symbol} — HMM (Stooq) y predicción determinista",
+    title=f"{SYMBOL} — HMM (Stooq) con VIX/tasas y predicción determinista",
     xaxis_title="Fecha",
     yaxis_title="Precio de cierre (log)",
     yaxis_type="log",
