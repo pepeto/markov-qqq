@@ -1,10 +1,6 @@
-ta-lib
 streamlit
-yfinance
 pandas
 numpy
-plotly
-scikit-learn
+pandas_datareader
 hmmlearn
-
-
+plotly
