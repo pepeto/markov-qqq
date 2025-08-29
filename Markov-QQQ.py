@@ -112,13 +112,20 @@ tail_n = min(3000, len(data))
 idx_tail = data.index[-tail_n:]
 states_tail = states.loc[idx_tail]
 
-for i, color in zip([0, 1], ["red", "green"]):
+# Mapear colores y nombres: bull -> verde, bear -> rojo
+bear_state = 1 - bull_state  # válido porque son 2 estados
+state_colors = {bull_state: "green", bear_state: "red"}
+state_names  = {bull_state: "Régimen alcista", bear_state: "Régimen bajista"}
+
+for i in [bear_state, bull_state]:
     mask = (states_tail == i)
     x = idx_tail[mask]
     y = data.loc[idx_tail, "Close"][mask]
     fig.add_trace(go.Scatter(
-        x=x, y=y, mode="markers", name=f"Estado {i+1}",
-        marker=dict(size=2, color=color), opacity=0.6
+        x=x, y=y, mode="markers",
+        name=state_names[i],
+        marker=dict(size=2, color=state_colors[i]),
+        opacity=0.6
     ))
 
 fig.add_trace(go.Scatter(
@@ -129,7 +136,8 @@ fig.add_trace(go.Scatter(
 fig.update_layout(
     title=f"{symbol} — HMM (Stooq) y predicción determinista",
     xaxis_title="Fecha",
-    yaxis_title="Precio de cierre",
+    yaxis_title="Precio de cierre (log)",
+    yaxis_type="log",
     template="plotly_dark",
     margin=dict(l=20, r=20, t=40, b=20)
 )
