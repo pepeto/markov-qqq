@@ -26,10 +26,10 @@ from pandas_datareader.data import DataReader
 # UI mínima
 # -----------------------------
 st.set_page_config(layout="wide")
-st.title("HMM minimalista (Stooq) — ensemble 5 semillas, covarianza full")
+st.title("HMM (Stooq) — ensemble 5 seeds, covariance full")
 
-ticker_in = st.text_input("Especie (Stooq)", "QQQ")
-forecast_horizon = int(st.number_input("Horizonte de predicción (días hábiles)", value=15, min_value=1, step=1))
+ticker_in = st.text_input("Species (Stooq)", "QQQ")
+forecast_horizon = int(st.number_input("Prediction (days)", value=15, min_value=1, step=1))
 
 SYMBOL = ticker_in.strip().upper()
 
@@ -55,7 +55,7 @@ if not needed.issubset(set(data.columns)):
     st.stop()
 
 if len(data) < 200:
-    st.error("Muy pocos datos para entrenar el HMM. Revisa el símbolo o el rango temporal.")
+    st.error("Too few data to train HMM.")
     st.stop()
 
 # -----------------------------
@@ -197,7 +197,7 @@ fig.add_trace(go.Scatter(
 ))
 
 fig.update_layout(
-    title=f"{SYMBOL} — HMM minimalista (ensemble 5 semillas) y predicción determinista",
+    title=f"{SYMBOL} — HMM & prediction",
     xaxis_title="Fecha",
     yaxis_title="Precio de cierre (log)",
     yaxis_type="log",
@@ -206,3 +206,4 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True)
+
